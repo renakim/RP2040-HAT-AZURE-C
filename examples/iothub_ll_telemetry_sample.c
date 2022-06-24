@@ -58,7 +58,18 @@ and removing calls to _DoWork will yield the same results. */
 //static const char* connectionString = "[device connection string]";
 static const char *connectionString = pico_az_connectionString;
 
-#define MESSAGE_COUNT 3
+// Amount of time to sleep between polling hub, in milliseconds.  Set to wake up every 100 milliseconds.
+static unsigned int g_sleepBetweenPollsMs = 100;
+
+// Every time the main loop wakes up, on the g_sendTelemetryPollInterval(th) pass will send a telemetry message.
+// So we will send telemetry every (g_sendTelemetryPollInterval * g_sleepBetweenPollsMs) milliseconds; 60 seconds as currently configured.
+static const int g_sendTelemetryPollInterval = 60000;
+
+
+#define RESET_GPIO  15
+#define LED_PIN     25
+
+#define MESSAGE_COUNT        3
 static bool g_continueRunning = true;
 static size_t g_message_count_send_confirmations = 0;
 static size_t g_message_recv_count = 0;
@@ -87,6 +98,59 @@ static void connection_status_callback(IOTHUB_CLIENT_CONNECTION_STATUS result, I
     }
 }
 
+static IOTHUBMESSAGE_DISPOSITION_RESULT receive_msg_callback(IOTHUB_MESSAGE_HANDLE message, void* user_context)
+{
+    (void)message;
+    (void)printf("Stop message recieved from IoTHub\r\n");
+    return IOTHUBMESSAGE_ACCEPTED;
+}
+
+static int deviceMethodCallback(const char* method_name, const unsigned char* payload, size_t size, unsigned char** response, size_t* response_size, void* userContextCallback)
+{
+    (void)userContextCallback;
+    (void)payload;
+    (void)size;
+
+    int result;
+
+    // User led on
+    printf("\n====================================================\n");
+    gpio_put(LED_PIN, 1);
+    printf("Device method %s arrived...\n", method_name);
+
+    if (strcmp("powerReset", method_name) == 0) {
+        printf("\nReceived device powerReset request.\n");
+
+        const char deviceMethodResponse[] = "{ \"Response\": \"powerReset OK\" }";
+        *response_size = sizeof(deviceMethodResponse)-1;
+        *response = malloc(*response_size);
+        (void)memcpy(*response, deviceMethodResponse, *response_size);
+        // TODO: 리셋 동작 구현
+
+        sleep_ms(500);
+        gpio_put(RESET_GPIO, 1);
+        sleep_ms(100);
+        gpio_put(RESET_GPIO, 0);
+
+        printf("Sent signal to Raspberry Pi.\n\n");
+
+        result = 200;
+    } else {
+        // All other entries are ignored.
+        const char deviceMethodResponse[] = "{ }";
+        *response_size = sizeof(deviceMethodResponse)-1;
+        *response = malloc(*response_size);
+        (void)memcpy(*response, deviceMethodResponse, *response_size);
+        result = -1;
+    }
+
+    // led off
+    gpio_put(LED_PIN, 0);
+    printf("====================================================\n\n");
+
+    return result;
+}
+
 void iothub_ll_telemetry_sample(void)
 {
     IOTHUB_CLIENT_TRANSPORT_PROVIDER protocol;
@@ -96,7 +160,7 @@ void iothub_ll_telemetry_sample(void)
 
     float telemetry_temperature;
     float telemetry_humidity;
-    const char *telemetry_scale = "Celsius";
+    // const char *telemetry_scale = "Celsius";
     const char *telemetry_msg = "test_message";
     char telemetry_msg_buffer[80];
 
@@ -155,20 +219,25 @@ void iothub_ll_telemetry_sample(void)
         // Setting connection status callback to get indication of connection to iothub
         (void)IoTHubDeviceClient_LL_SetConnectionStatusCallback(device_ll_handle, connection_status_callback, NULL);
 
-        do
-        {
-            if (messages_sent < MESSAGE_COUNT)
-            {
-                // // Construct the iothub message from a string or a byte array
-                //message_handle = IoTHubMessage_CreateFromString(telemetry_msg);
-                // //message_handle = IoTHubMessage_CreateFromByteArray((const unsigned char*)msgText, strlen(msgText)));
+        (void)IoTHubDeviceClient_LL_SetMessageCallback(device_ll_handle, receive_msg_callback, NULL);
+        (void)IoTHubDeviceClient_LL_SetDeviceMethodCallback(device_ll_handle, deviceMethodCallback, NULL);
 
-                // Construct the iothub message
+        int numberOfIterations = 0;
+        while(true) {
+            // // Construct the iothub message from a string or a byte array
+            // message_handle = IoTHubMessage_CreateFromString(telemetry_msg);
+            // //message_handle = IoTHubMessage_CreateFromByteArray((const unsigned char*)msgText, strlen(msgText)));
+
+            // Wake up periodically to poll.  Even if we do not plan on sending telemetry, we still need to poll periodically in order to process
+            // incoming requests from the server and to do connection keep alives.
+            if ((numberOfIterations % g_sendTelemetryPollInterval) == 0)
+            {
+                 // Construct the iothub message
                 telemetry_temperature = 20.0f + ((float)rand() / RAND_MAX) * 15.0f;
                 telemetry_humidity = 60.0f + ((float)rand() / RAND_MAX) * 20.0f;
 
-                sprintf(telemetry_msg_buffer, "{\"temperature\":%.3f,\"humidity\":%.3f,\"scale\":\"%s\"}",
-                        telemetry_temperature, telemetry_humidity, telemetry_scale);
+                sprintf(telemetry_msg_buffer, "{\"temperature\":%.3f,\"humidity\":%.3f,\"count\":\"%d\"}",
+                        telemetry_temperature, telemetry_humidity, messages_sent);
                 message_handle = IoTHubMessage_CreateFromString(telemetry_msg_buffer);
 
                 // Set Message property
@@ -193,17 +262,11 @@ void iothub_ll_telemetry_sample(void)
 
                 messages_sent++;
             }
-            else if (g_message_count_send_confirmations >= MESSAGE_COUNT)
-            {
-                // After all messages are all received stop running
-                g_continueRunning = false;
-            }
-
             IoTHubDeviceClient_LL_DoWork(device_ll_handle);
-
-            sleep_ms(500); // wait for
-
-        } while (g_continueRunning);
+            ThreadAPI_Sleep(g_sleepBetweenPollsMs);
+            numberOfIterations++;
+            // sleep_ms(60000); // wait for 
+        }
 
         // Clean up the iothub sdk handle
         IoTHubDeviceClient_LL_Destroy(device_ll_handle);
